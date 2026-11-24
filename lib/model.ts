@@ -61,13 +61,34 @@ export const MODEL: ModelConstants = {
   maturity_range: 0.4,
   maturity_days: 1095,
   unknown_age_days: 365,
-};
+}
+/** High-potential categories that get a scoring multiplier. */
+const HIGH_POTENTIAL_CATEGORIES: ReadonlySet<string> = new Set([
+  'Lending',
+  'Liquid Staking',
+  'Restaking',
+  'Bridging',
+  'Rwa',
+  'RWA',
+  'DePin',
+  'Derivatives',
+  'Perpetual',
+]);
 
-/** The model's version label: the dashboard names it and the rules quote it. */
-export const MODEL_VERSION = 'radar-1';
+/** Multiplier applied to high-potential categories. */
+const CATEGORY_MULTIPLIER = 1.15;
+
+/** TVL threshold (USD) above which a pre-token protocol gets the undiscovered-gems bonus. */
+const UNDISCOVERED_GEMS_TVL_THRESHOLD = 50_000_000;
+
+/** Bonus multiplier for high-TVL pre-token protocols (undiscovered gems). */
+const UNDISCOVERED_GEMS_BONUS = 1.2;
+
+/** Model version label. */
+export const MODEL_VERSION = 'radar-2';
 
 /** How many pre-token protocols below the watchlist floor the early radar carries, by TVL. */
-export const EARLY_ROWS = 160;
+export const EARLY_ROWS = 200;
 
 /** How many live-token protocols the Live token view carries, by market cap. */
 export const LIVE_ROWS = 24;
@@ -176,12 +197,32 @@ export function ageDays(asOf: string, listedAt: string | null): number | null {
 export function impliedValue(protocol: SnapshotProtocol, asOf: string, model: ModelConstants): { implied: number; growthPct: number; growthMult: number; maturityMult: number; age: number | null } {
   const age = ageDays(asOf, protocol.listed_at);
   const rawGrowth = finite(protocol.change_7d, 0);
-  const growthPct = Math.min(model.growth_cap, Math.max(model.growth_floor, rawGrowth));
+  // Apply momentum sensitivity: amplify growth when it is strongly positive or negative.
+  // Linear below 20%, 1.5x multiplier above to reward strong momentum.
+  let momentumGrowth = rawGrowth;
+  if (rawGrowth > 20) {
+    momentumGrowth = 20 + (rawGrowth - 20) * 1.5;
+  } else if (rawGrowth < -20) {
+    momentumGrowth = -20 + (rawGrowth + 20) * 1.5;
+  }
+  const growthPct = Math.min(model.growth_cap, Math.max(model.growth_floor, momentumGrowth));
   const growthMult = 1 + (growthPct / 100) * model.growth_weight;
   const ageForModel = age ?? model.unknown_age_days;
   const maturityMult = model.maturity_floor + (Math.min(Math.max(ageForModel, 0), model.maturity_days) / model.maturity_days) * model.maturity_range;
   const base = protocol.tvl_usd * model.base_multiple;
-  const implied = Math.max(1, Math.round(base * growthMult * maturityMult));
+  let implied = base * growthMult * maturityMult;
+
+  // Category-based multiplier for high-potential categories.
+  if (protocol.category && HIGH_POTENTIAL_CATEGORIES.has(protocol.category)) {
+    implied *= CATEGORY_MULTIPLIER;
+  }
+
+  // Undiscovered gems bonus: high TVL + no token = strong signal.
+  if (isPreToken(protocol) && protocol.tvl_usd >= UNDISCOVERED_GEMS_TVL_THRESHOLD) {
+    implied *= UNDISCOVERED_GEMS_BONUS;
+  }
+
+  implied = Math.max(1, Math.round(implied));
   return { implied, growthPct, growthMult, maturityMult, age };
 }
 
